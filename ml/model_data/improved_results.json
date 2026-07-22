@@ -1,0 +1,11 @@
+{
+  "optimal_threshold": 0.4600000000000001,
+  "ensemble_weights": [
+    0.5,
+    0.5
+  ],
+  "performance": {
+    "ensemble_acc": 0.6238222222222222,
+    "difficulty_acc": 0.9875555555555555
+  }
+}

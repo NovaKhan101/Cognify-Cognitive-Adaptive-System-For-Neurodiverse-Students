@@ -1,18 +1,1413 @@
+# """
+# COGNIFY - Deep Knowledge Tracing (DKT) V3 TUNED
+# =================================================
+# Tracks student knowledge state per domain over time.
+# Standard DKT formulation from Piech et al. (2015):
+#   Input:  one-hot encoding of (skill, outcome) + behavioral context
+#   Output: probability of correct on each skill next time — size n_skills
+
+# TUNING CHANGES:
+#   - hidden_size: 128 → 256
+#   - num_layers: 2 → 3
+#   - Input: + session_fatigue_index + frustration_flag (18-dim)
+#   - epochs: 80 → 150, lr: 0.001 → 0.0005, patience: 15 → 25
+
+# Run after: generate_asd_data_v3.py
+# """
+
+# import numpy as np
+# import torch
+# import torch.nn as nn
+# from torch.utils.data import DataLoader, TensorDataset
+# from sklearn.metrics import accuracy_score, roc_auc_score
+# import pandas as pd
+# import pickle
+# import json
+# import os
+# import time
+# import warnings
+# warnings.filterwarnings('ignore')
+
+# print("=" * 60)
+# print("COGNIFY - Deep Knowledge Tracing (DKT) V3 TUNED")
+# print("=" * 60)
+
+# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# print(f"\n🖥️  Device: {device}")
+# if torch.cuda.is_available():
+#     print(f"   GPU: {torch.cuda.get_device_name(0)}")
+
+# # ==================== CONFIG (TUNED) ====================
+# CONFIG = {
+#     'hidden_size': 256,       # TUNED: 128 → 256
+#     'num_layers': 3,          # TUNED: 2 → 3
+#     'dropout': 0.3,
+#     'batch_size': 32,
+#     'learning_rate': 0.0005,  # TUNED: 0.001 → 0.0005
+#     'epochs': 150,            # TUNED: 80 → 150
+#     'patience': 25,           # TUNED: 15 → 25
+#     'weight_decay': 1e-4,
+# }
+
+# # ==================== LOAD DATA ====================
+# print("\n📂 Loading data...")
+# os.makedirs('model_data', exist_ok=True)
+# df = pd.read_csv('cognify_synthetic_data_v3.csv')
+# df = df.sort_values(['student_id', 'session_id', 'sequence_step']).reset_index(drop=True)
+
+# domains = sorted(df['domain_id'].unique().tolist())
+# domain_to_idx = {d: i for i, d in enumerate(domains)}
+# n_domains = len(domains)
+
+# print(f"   Records:  {len(df)}")
+# print(f"   Students: {df['student_id'].nunique()}")
+# print(f"   Domains:  {n_domains} → {domains}")
+
+# # ==================== DKT INPUT ENCODING (TUNED: + behavioral) ====================
+# n_skills = n_domains * 2
+# n_behavioral = 2  # fatigue_index + frustration_flag
+# input_size = n_skills + n_behavioral
+# print(f"\n🔧 DKT encoding: {input_size} dim ({n_skills} domain-outcome + {n_behavioral} behavioral)")
+
+# def encode_interaction(domain_idx, correct, fatigue, frustration):
+#     """
+#     Enhanced DKT encoding with behavioral context.
+#     vec[0:n_domains] = correct one-hot
+#     vec[n_domains:2*n_domains] = incorrect one-hot
+#     vec[2*n_domains] = session_fatigue_index
+#     vec[2*n_domains+1] = frustration_flag
+#     """
+#     vec = np.zeros(input_size)
+#     if correct:
+#         vec[domain_idx] = 1.0
+#     else:
+#         vec[domain_idx + n_domains] = 1.0
+#     vec[n_skills] = fatigue
+#     vec[n_skills + 1] = frustration
+#     return vec
+
+# def build_dkt_sequences(df, min_seq_len=5):
+#     """
+#     Standard DKT sequence building with behavioral context.
+#     Target format: -1 for untested domains, 0/1 for tested domain.
+#     """
+#     X_sequences = []
+#     y_sequences = []
+#     student_ids = []
+
+#     for student_id in df['student_id'].unique():
+#         student_data = df[df["student_id"] == student_id].reset_index(drop=True)
+
+#         if len(student_data) < min_seq_len + 2:
+#             continue
+
+#         interactions = []
+#         targets = []
+
+#         for _, row in student_data.iterrows():
+#             domain_idx = domain_to_idx[row["domain_id"]]
+#             correct = int(row["correct"])
+#             fatigue = float(row["session_fatigue_index"])
+#             frustration = float(row["frustration_flag"])
+
+#             interaction = encode_interaction(domain_idx, correct, fatigue, frustration)
+#             interactions.append(interaction)
+#             targets.append((domain_idx, correct))
+
+#         # Build sequences: predict step i from history [0:i]
+#         for i in range(min_seq_len, len(interactions) - 1):
+#             seq_x = np.array(interactions[max(0, i-20):i])
+
+#             # Target: the NEXT interaction's (domain, correctness)
+#             next_domain, next_correct = targets[i]
+
+#             # -1 for untested, 0/1 for tested
+#             target = np.full(n_domains, -1.0)
+#             target[next_domain] = float(next_correct)
+
+#             # Pad if shorter than 20
+#             if len(seq_x) < 20:
+#                 pad = np.zeros((20 - len(seq_x), input_size))
+#                 seq_x = np.vstack([pad, seq_x])
+
+#             X_sequences.append(seq_x)
+#             y_sequences.append(target)
+#             student_ids.append(student_id)
+
+#     return np.array(X_sequences), np.array(y_sequences), student_ids
+
+# print("\n🔁 Building DKT sequences...")
+# X_dkt, y_dkt, student_ids_dkt = build_dkt_sequences(df)
+# print(f"   Sequences shape: {X_dkt.shape}")
+# print(f"   Targets shape:   {y_dkt.shape}")
+# print(f"   Target values:   {-1:>3} (untested), {0:>3}/{1:>3} (tested)")
+
+# # Train/val/test split (by student to avoid leakage)
+# unique_students = list(set(student_ids_dkt))
+# np.random.seed(42)
+# np.random.shuffle(unique_students)
+
+# n_train = int(len(unique_students) * 0.7)
+# n_val   = int(len(unique_students) * 0.15)
+
+# train_students = set(unique_students[:n_train])
+# val_students   = set(unique_students[n_train:n_train + n_val])
+# test_students  = set(unique_students[n_train + n_val:])
+
+# train_mask = [sid in train_students for sid in student_ids_dkt]
+# val_mask   = [sid in val_students   for sid in student_ids_dkt]
+# test_mask  = [sid in test_students  for sid in student_ids_dkt]
+
+# X_train = X_dkt[train_mask]
+# X_val   = X_dkt[val_mask]
+# X_test  = X_dkt[test_mask]
+# y_train = y_dkt[train_mask]
+# y_val   = y_dkt[val_mask]
+# y_test  = y_dkt[test_mask]
+
+# print(f"   Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
+
+# # ==================== MASKED LOSS ====================
+# class MaskedBCEWithLogitsLoss(nn.Module):
+#     """
+#     Masked BCE loss: only compute loss on positions where target != -1.
+#     """
+#     def __init__(self):
+#         super().__init__()
+#         self.bce = nn.BCEWithLogitsLoss(reduction='none')
+
+#     def forward(self, preds, targets):
+#         mask = (targets >= 0).float()
+#         if mask.sum() == 0:
+#             return torch.tensor(0.0, requires_grad=True, device=preds.device)
+#         loss = self.bce(preds, targets)
+#         loss = (loss * mask).sum() / mask.sum()
+#         return loss
+
+# # ==================== DKT MODEL (TUNED) ====================
+# class DKTModel(nn.Module):
+#     def __init__(self, input_size, hidden_size, num_layers, n_domains, dropout=0.3):
+#         super(DKTModel, self).__init__()
+#         self.hidden_size = hidden_size
+#         self.n_domains = n_domains
+
+#         self.lstm = nn.LSTM(
+#             input_size=input_size,
+#             hidden_size=hidden_size,
+#             num_layers=num_layers,
+#             batch_first=True,
+#             dropout=dropout if num_layers > 1 else 0,
+#         )
+#         self.output_layer = nn.Linear(hidden_size, n_domains)
+
+#     def forward(self, x):
+#         lstm_out, (h_n, _) = self.lstm(x)
+#         last_hidden = lstm_out[:, -1, :]
+#         predictions = self.output_layer(last_hidden)
+#         return predictions
+
+#     def get_knowledge_state(self, x):
+#         """Extract knowledge state (sigmoid of predictions)"""
+#         with torch.no_grad():
+#             preds = self.forward(x)
+#             return torch.sigmoid(preds)
+
+# # ==================== TRAINING ====================
+# def train_dkt(model, X_train, X_val, y_train, y_val):
+#     train_ds = TensorDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_train))
+#     val_ds   = TensorDataset(torch.FloatTensor(X_val),   torch.FloatTensor(y_val))
+#     train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True)
+#     val_loader   = DataLoader(val_ds,   batch_size=CONFIG['batch_size'])
+
+#     criterion = MaskedBCEWithLogitsLoss()
+#     optimizer = torch.optim.Adam(
+#         model.parameters(),
+#         lr=CONFIG['learning_rate'],
+#         weight_decay=CONFIG['weight_decay']
+#     )
+#     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+#         optimizer, patience=5, factor=0.5
+#     )
+
+#     best_val_auc = 0
+#     patience_ctr = 0
+#     history = {'train_loss': [], 'val_loss': [], 'val_auc': []}
+
+#     print(f"\n🏋️  Training DKT Model (TUNED)...")
+#     print(f"   Parameters: {sum(p.numel() for p in model.parameters()):,}")
+#     print(f"   Epochs: {CONFIG['epochs']} | Patience: {CONFIG['patience']}")
+#     print(f"   LR: {CONFIG['learning_rate']} | Hidden: {CONFIG['hidden_size']} | Layers: {CONFIG['num_layers']}")
+#     print(f"   Input: {input_size} dim ({n_skills} domain + {n_behavioral} behavioral)")
+#     print(f"   Loss: MaskedBCEWithLogitsLoss (only tested domain)")
+
+#     for epoch in range(CONFIG['epochs']):
+#         start = time.time()
+
+#         # Train
+#         model.train()
+#         train_loss = 0
+#         for X_batch, y_batch in train_loader:
+#             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+#             optimizer.zero_grad()
+#             preds = model(X_batch)
+#             loss = criterion(preds, y_batch)
+#             loss.backward()
+#             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+#             optimizer.step()
+#             train_loss += loss.item()
+
+#         # Validate
+#         model.eval()
+#         val_loss = 0
+#         val_preds_all, val_targets_all = [], []
+#         with torch.no_grad():
+#             for X_batch, y_batch in val_loader:
+#                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+#                 preds = model(X_batch)
+#                 loss = criterion(preds, y_batch)
+#                 val_loss += loss.item()
+#                 val_preds_all.append(torch.sigmoid(preds).cpu().numpy())
+#                 val_targets_all.append(y_batch.cpu().numpy())
+
+#         avg_train_loss = train_loss / len(train_loader)
+#         avg_val_loss = val_loss / len(val_loader)
+
+#         val_preds_arr = np.vstack(val_preds_all)
+#         val_targets_arr = np.vstack(val_targets_all)
+
+#         # Compute AUC per domain (only on tested samples)
+#         aucs = []
+#         for d in range(n_domains):
+#             mask = val_targets_arr[:, d] >= 0
+#             y_true_d = val_targets_arr[:, d][mask]
+#             y_pred_d = val_preds_arr[:, d][mask]
+
+#             if len(y_true_d) > 0 and len(np.unique(y_true_d)) > 1:
+#                 try:
+#                     auc = roc_auc_score(y_true_d, y_pred_d)
+#                     aucs.append(auc)
+#                 except:
+#                     pass
+
+#         val_auc = np.mean(aucs) if aucs else 0.5
+
+#         history['train_loss'].append(avg_train_loss)
+#         history['val_loss'].append(avg_val_loss)
+#         history['val_auc'].append(val_auc)
+#         scheduler.step(avg_val_loss)
+
+#         if (epoch + 1) % 5 == 0 or epoch == 0:
+#             print(f"   Epoch {epoch+1:3d}/{CONFIG['epochs']} | "
+#                   f"Train Loss: {avg_train_loss:.4f} | "
+#                   f"Val Loss: {avg_val_loss:.4f} | "
+#                   f"Val AUC: {val_auc:.4f} | "
+#                   f"Time: {time.time()-start:.1f}s")
+
+#         if val_auc > best_val_auc:
+#             best_val_auc = val_auc
+#             patience_ctr = 0
+#             torch.save(model.state_dict(), 'model_data/best_dkt_model.pth')
+#         else:
+#             patience_ctr += 1
+#             if patience_ctr >= CONFIG['patience']:
+#                 print(f"   ⏹️  Early stopping at epoch {epoch+1}")
+#                 break
+
+#     print(f"   ✅ Best Val AUC: {best_val_auc:.4f}")
+#     return history, best_val_auc
+
+# # ==================== EVALUATE DKT ====================
+# def evaluate_dkt(model, X_test, y_test):
+#     model.eval()
+#     ds = DataLoader(TensorDataset(torch.FloatTensor(X_test)), batch_size=64)
+#     all_preds = []
+#     with torch.no_grad():
+#         for (xb,) in ds:
+#             preds = torch.sigmoid(model(xb.to(device)))
+#             all_preds.append(preds.cpu().numpy())
+#     all_preds = np.vstack(all_preds)
+
+#     print(f"\n📊 DKT Evaluation Results:")
+#     print(f"   {'Domain':<20} {'AUC':>8} {'Accuracy':>10} {'N Tested':>10}")
+#     print(f"   {'-'*52}")
+
+#     domain_aucs = []
+#     domain_accs = []
+
+#     for d, domain in enumerate(domains):
+#         mask = y_test[:, d] >= 0
+#         y_true = y_test[:, d][mask]
+#         y_pred_prob = all_preds[:, d][mask]
+#         y_pred_bin = (y_pred_prob > 0.5).astype(int)
+
+#         n_tested = len(y_true)
+#         acc = accuracy_score(y_true, y_pred_bin) if n_tested > 0 else 0.0
+
+#         if n_tested > 0 and len(np.unique(y_true)) > 1:
+#             try:
+#                 auc = roc_auc_score(y_true, y_pred_prob)
+#             except:
+#                 auc = 0.5
+#         else:
+#             auc = 0.5
+
+#         domain_aucs.append(auc)
+#         domain_accs.append(acc)
+#         print(f"   {domain:<20} {auc:>8.4f} {acc:>10.4f} {n_tested:>10}")
+
+#     mean_auc = np.mean(domain_aucs)
+#     mean_acc = np.mean(domain_accs)
+#     print(f"   {'-'*52}")
+#     print(f"   {'MEAN':<20} {mean_auc:>8.4f} {mean_acc:>10.4f}")
+
+#     return mean_auc, mean_acc, all_preds
+
+# # ==================== KNOWLEDGE STATE DEMO ====================
+# def demo_knowledge_state(model, df, student_id=None):
+#     if student_id is None:
+#         student_id = df['student_id'].unique()[0]
+
+#     student_data = df[df["student_id"] == student_id].reset_index(drop=True)
+#     print(f"\n🧠 Knowledge State Demo — Student: {student_id}")
+#     print(f"   Total attempts: {len(student_data)}")
+
+#     interactions = []
+#     for _, row in student_data.iterrows():
+#         domain_idx = domain_to_idx[row['domain_id']]
+#         correct = int(row['correct'])
+#         fatigue = float(row['session_fatigue_index'])
+#         frustration = float(row['frustration_flag'])
+#         interaction = encode_interaction(domain_idx, correct, fatigue, frustration)
+#         interactions.append(interaction)
+
+#     checkpoints = [5, 10, 20, min(50, len(interactions) - 1)]
+#     checkpoints = [c for c in checkpoints if c < len(interactions)]
+
+#     print(f"\n   {'Domain':<22}", end='')
+#     for cp in checkpoints:
+#         print(f"  After {cp:2d} tasks", end='')
+#     print()
+#     print(f"   {'-'*70}")
+
+#     for d, domain in enumerate(domains):
+#         print(f"   {domain:<22}", end='')
+#         for cp in checkpoints:
+#             seq = np.array(interactions[:cp])
+#             if len(seq) < 20:
+#                 pad = np.zeros((20 - len(seq), input_size))
+#                 seq = np.vstack([pad, seq])
+#             else:
+#                 seq = seq[-20:]
+
+#             x = torch.FloatTensor(seq).unsqueeze(0).to(device)
+#             with torch.no_grad():
+#                 ks = model.get_knowledge_state(x)
+#             mastery = ks[0, d].item() * 100
+#             print(f"  {mastery:5.1f}%", end='')
+#         print()
+
+# # ==================== RUN TRAINING ====================
+# dkt_model = DKTModel(
+#     input_size=input_size,
+#     hidden_size=CONFIG['hidden_size'],
+#     num_layers=CONFIG['num_layers'],
+#     n_domains=n_domains,
+#     dropout=CONFIG['dropout']
+# ).to(device)
+
+# history, best_val_auc = train_dkt(dkt_model, X_train, X_val, y_train, y_val)
+
+# # Load best model
+# dkt_model.load_state_dict(torch.load('model_data/best_dkt_model.pth'))
+
+# # Evaluate
+# mean_auc, mean_acc, test_preds = evaluate_dkt(dkt_model, X_test, y_test)
+
+# # Knowledge state demo
+# demo_knowledge_state(dkt_model, df)
+
+# # ==================== SAVE ====================
+# print("\n💾 Saving DKT model...")
+
+# torch.save(dkt_model.state_dict(), 'model_data/dkt_model_final_tuned.pth')
+
+# dkt_meta = {
+#     'config': CONFIG,
+#     'domains': domains,
+#     'domain_to_idx': domain_to_idx,
+#     'n_domains': n_domains,
+#     'n_skills': n_skills,
+#     'n_behavioral': n_behavioral,
+#     'input_size': input_size,
+#     'results': {
+#         'mean_auc': float(mean_auc),
+#         'mean_acc': float(mean_acc),
+#         'best_val_auc': float(best_val_auc),
+#     },
+#     'history': {k: [float(v) for v in vals] for k, vals in history.items()}
+# }
+
+# with open('model_data/dkt_meta_tuned.json', 'w') as f:
+#     json.dump(dkt_meta, f, indent=2)
+
+# with open('model_data/dkt_meta_tuned.pkl', 'wb') as f:
+#     pickle.dump({
+#         **dkt_meta,
+#         'encode_interaction_fn': encode_interaction,
+#     }, f)
+
+# np.save('model_data/dkt_X_test_tuned.npy', X_test)
+# np.save('model_data/dkt_y_test_tuned.npy', y_test)
+
+# print(f"\n{'='*60}")
+# print("✅ DKT TRAINING COMPLETE (TUNED)!")
+# print(f"{'='*60}")
+# print(f"   Mean AUC:     {mean_auc:.4f}")
+# print(f"   Mean Acc:     {mean_acc:.4f}")
+# print(f"   Best Val AUC: {best_val_auc:.4f}")
+# print(f"   Domains:      {n_domains}")
+# print(f"   Input dim:    {input_size} ({n_skills} + {n_behavioral} behavioral)")
+# print(f"\n   What DKT gives you:")
+# print(f"   → Per-domain mastery score (0-100%) per student")
+# print(f"   → Knowledge state evolution over time")
+# print(f"   → Behavioral-aware predictions (fatigue + frustration)")
+# print(f"\n📁 Saved: model_data/dkt_model_final_tuned.pth")
+
+# """
+# COGNIFY - Deep Knowledge Tracing (DKT) V4
+# =========================================
+# Tracks student knowledge state per domain over time.
+# Standard DKT formulation from Piech et al. (2015):
+#   Input:  one-hot encoding of (skill, outcome) + behavioral context
+#   Output: probability of correct on each skill next time — size n_skills
+
+# V4 CHANGES:
+#   - Input filename unified to cognify_synthetic_data.csv
+#   - Checkpoints extended to 295 for 15-session students
+#   - dtype=np.float32 everywhere to prevent memory errors
+#   - Naming unified to v4 convention
+
+# Run after: generate_asd_data_v4.py
+# """
+
+# import numpy as np
+# import torch
+# import torch.nn as nn
+# from torch.utils.data import DataLoader, TensorDataset
+# from sklearn.metrics import accuracy_score, roc_auc_score
+# import pandas as pd
+# import json
+# import os
+# import time
+# import warnings
+# warnings.filterwarnings('ignore')
+
+# print("=" * 60)
+# print("COGNIFY - Deep Knowledge Tracing (DKT) V4")
+# print("=" * 60)
+
+# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# print(f"\n🖥️  Device: {device}")
+# if torch.cuda.is_available():
+#     print(f"   GPU: {torch.cuda.get_device_name(0)}")
+
+# # ==================== CONFIG (TUNED) ====================
+# CONFIG = {
+#     'hidden_size': 256,
+#     'num_layers': 3,
+#     'dropout': 0.3,
+#     'batch_size': 32,
+#     'learning_rate': 0.0005,
+#     'epochs': 150,
+#     'patience': 25,
+#     'weight_decay': 1e-4,
+# }
+
+# # ==================== LOAD DATA ====================
+# print("\n📂 Loading data...")
+# os.makedirs('model_data', exist_ok=True)
+
+# df = pd.read_csv('cognify_synthetic_data.csv')
+# df = df.sort_values(['student_id', 'session_id', 'sequence_step']).reset_index(drop=True)
+
+# domains = sorted(df['domain_id'].unique().tolist())
+# domain_to_idx = {d: i for i, d in enumerate(domains)}
+# n_domains = len(domains)
+
+# print(f"   Records:  {len(df)}")
+# print(f"   Students: {df['student_id'].nunique()}")
+# print(f"   Domains:  {n_domains} → {domains}")
+
+# # ==================== DKT INPUT ENCODING ====================
+# n_skills = n_domains * 2
+# n_behavioral = 2
+# input_size = n_skills + n_behavioral
+# print(f"\n🔧 DKT encoding: {input_size} dim ({n_skills} domain-outcome + {n_behavioral} behavioral)")
+
+
+# def encode_interaction(domain_idx, correct, fatigue, frustration):
+#     """
+#     Enhanced DKT encoding with behavioral context.
+#     vec[0:n_domains] = correct one-hot
+#     vec[n_domains:2*n_domains] = incorrect one-hot
+#     vec[2*n_domains] = session_fatigue_index
+#     vec[2*n_domains+1] = frustration_flag
+#     """
+#     vec = np.zeros(input_size, dtype=np.float32)
+#     if correct:
+#         vec[domain_idx] = 1.0
+#     else:
+#         vec[domain_idx + n_domains] = 1.0
+#     vec[n_skills] = fatigue
+#     vec[n_skills + 1] = frustration
+#     return vec
+
+
+# def build_dkt_sequences(df, min_seq_len=5):
+#     """
+#     Standard DKT sequence building with behavioral context.
+#     Target format: -1 for untested domains, 0/1 for tested domain.
+#     """
+#     X_sequences = []
+#     y_sequences = []
+#     student_ids = []
+
+#     for student_id in df['student_id'].unique():
+#         student_data = df[df["student_id"] == student_id].reset_index(drop=True)
+
+#         if len(student_data) < min_seq_len + 2:
+#             continue
+
+#         interactions = []
+#         targets = []
+
+#         for _, row in student_data.iterrows():
+#             domain_idx = domain_to_idx[row["domain_id"]]
+#             correct = int(row["correct"])
+#             fatigue = float(row["session_fatigue_index"])
+#             frustration = float(row["frustration_flag"])
+
+#             interaction = encode_interaction(domain_idx, correct, fatigue, frustration)
+#             interactions.append(interaction)
+#             targets.append((domain_idx, correct))
+
+#         for i in range(min_seq_len, len(interactions) - 1):
+#             seq_x = np.array(interactions[max(0, i - 20):i])
+
+#             next_domain, next_correct = targets[i]
+
+#             target = np.full(n_domains, -1.0, dtype=np.float32)
+#             target[next_domain] = float(next_correct)
+
+#             if len(seq_x) < 20:
+#                 pad = np.zeros((20 - len(seq_x), input_size), dtype=np.float32)
+#                 seq_x = np.vstack([pad, seq_x])
+
+#             X_sequences.append(seq_x)
+#             y_sequences.append(target)
+#             student_ids.append(student_id)
+
+#     return np.array(X_sequences, dtype=np.float32), np.array(y_sequences, dtype=np.float32), student_ids
+
+
+# print("\n🔁 Building DKT sequences...")
+# X_dkt, y_dkt, student_ids_dkt = build_dkt_sequences(df)
+# print(f"   Sequences shape: {X_dkt.shape}")
+# print(f"   Targets shape:   {y_dkt.shape}")
+# print(f"   Target values:   {-1:>3} (untested), {0:>3}/{1:>3} (tested)")
+
+# # Train/val/test split (by student to avoid leakage)
+# unique_students = list(set(student_ids_dkt))
+# np.random.seed(42)
+# np.random.shuffle(unique_students)
+
+# n_train = int(len(unique_students) * 0.7)
+# n_val = int(len(unique_students) * 0.15)
+
+# train_students = set(unique_students[:n_train])
+# val_students = set(unique_students[n_train:n_train + n_val])
+# test_students = set(unique_students[n_train + n_val:])
+
+# train_mask = [sid in train_students for sid in student_ids_dkt]
+# val_mask = [sid in val_students for sid in student_ids_dkt]
+# test_mask = [sid in test_students for sid in student_ids_dkt]
+
+# X_train = X_dkt[train_mask]
+# X_val = X_dkt[val_mask]
+# X_test = X_dkt[test_mask]
+# y_train = y_dkt[train_mask]
+# y_val = y_dkt[val_mask]
+# y_test = y_dkt[test_mask]
+
+# print(f"   Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
+
+# # ==================== MASKED LOSS ====================
+# class MaskedBCEWithLogitsLoss(nn.Module):
+#     """
+#     Masked BCE loss: only compute loss on positions where target != -1.
+#     """
+#     def __init__(self):
+#         super().__init__()
+#         self.bce = nn.BCEWithLogitsLoss(reduction='none')
+
+#     def forward(self, preds, targets):
+#         mask = (targets >= 0).float()
+#         if mask.sum() == 0:
+#             return torch.tensor(0.0, requires_grad=True, device=preds.device)
+#         loss = self.bce(preds, targets)
+#         loss = (loss * mask).sum() / mask.sum()
+#         return loss
+
+# # ==================== DKT MODEL (TUNED) ====================
+# class DKTModel(nn.Module):
+#     def __init__(self, input_size, hidden_size, num_layers, n_domains, dropout=0.3):
+#         super(DKTModel, self).__init__()
+#         self.hidden_size = hidden_size
+#         self.n_domains = n_domains
+
+#         self.lstm = nn.LSTM(
+#             input_size=input_size,
+#             hidden_size=hidden_size,
+#             num_layers=num_layers,
+#             batch_first=True,
+#             dropout=dropout if num_layers > 1 else 0,
+#         )
+#         self.output_layer = nn.Linear(hidden_size, n_domains)
+
+#     def forward(self, x):
+#         lstm_out, (h_n, _) = self.lstm(x)
+#         last_hidden = lstm_out[:, -1, :]
+#         predictions = self.output_layer(last_hidden)
+#         return predictions
+
+#     def get_knowledge_state(self, x):
+#         """Extract knowledge state (sigmoid of predictions)"""
+#         with torch.no_grad():
+#             preds = self.forward(x)
+#             return torch.sigmoid(preds)
+
+# # ==================== TRAINING ====================
+# def train_dkt(model, X_train, X_val, y_train, y_val):
+#     train_ds = TensorDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_train))
+#     val_ds = TensorDataset(torch.FloatTensor(X_val), torch.FloatTensor(y_val))
+#     train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True)
+#     val_loader = DataLoader(val_ds, batch_size=CONFIG['batch_size'])
+
+#     criterion = MaskedBCEWithLogitsLoss()
+#     optimizer = torch.optim.Adam(
+#         model.parameters(),
+#         lr=CONFIG['learning_rate'],
+#         weight_decay=CONFIG['weight_decay']
+#     )
+#     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+#         optimizer, patience=5, factor=0.5
+#     )
+
+#     best_val_auc = 0
+#     patience_ctr = 0
+#     history = {'train_loss': [], 'val_loss': [], 'val_auc': []}
+
+#     print(f"\n🏋️  Training DKT Model (V4)...")
+#     print(f"   Parameters: {sum(p.numel() for p in model.parameters()):,}")
+#     print(f"   Epochs: {CONFIG['epochs']} | Patience: {CONFIG['patience']}")
+#     print(f"   LR: {CONFIG['learning_rate']} | Hidden: {CONFIG['hidden_size']} | Layers: {CONFIG['num_layers']}")
+#     print(f"   Input: {input_size} dim ({n_skills} domain + {n_behavioral} behavioral)")
+#     print(f"   Loss: MaskedBCEWithLogitsLoss (only tested domain)")
+
+#     for epoch in range(CONFIG['epochs']):
+#         start = time.time()
+
+#         model.train()
+#         train_loss = 0
+#         for X_batch, y_batch in train_loader:
+#             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+#             optimizer.zero_grad()
+#             preds = model(X_batch)
+#             loss = criterion(preds, y_batch)
+#             loss.backward()
+#             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+#             optimizer.step()
+#             train_loss += loss.item()
+
+#         model.eval()
+#         val_loss = 0
+#         val_preds_all, val_targets_all = [], []
+#         with torch.no_grad():
+#             for X_batch, y_batch in val_loader:
+#                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+#                 preds = model(X_batch)
+#                 loss = criterion(preds, y_batch)
+#                 val_loss += loss.item()
+#                 val_preds_all.append(torch.sigmoid(preds).cpu().numpy())
+#                 val_targets_all.append(y_batch.cpu().numpy())
+
+#         avg_train_loss = train_loss / len(train_loader)
+#         avg_val_loss = val_loss / len(val_loader)
+
+#         val_preds_arr = np.vstack(val_preds_all)
+#         val_targets_arr = np.vstack(val_targets_all)
+
+#         aucs = []
+#         for d in range(n_domains):
+#             mask = val_targets_arr[:, d] >= 0
+#             y_true_d = val_targets_arr[:, d][mask]
+#             y_pred_d = val_preds_arr[:, d][mask]
+
+#             if len(y_true_d) > 0 and len(np.unique(y_true_d)) > 1:
+#                 try:
+#                     auc = roc_auc_score(y_true_d, y_pred_d)
+#                     aucs.append(auc)
+#                 except:
+#                     pass
+
+#         val_auc = np.mean(aucs) if aucs else 0.5
+
+#         history['train_loss'].append(avg_train_loss)
+#         history['val_loss'].append(avg_val_loss)
+#         history['val_auc'].append(val_auc)
+#         scheduler.step(avg_val_loss)
+
+#         if (epoch + 1) % 5 == 0 or epoch == 0:
+#             print(f"   Epoch {epoch+1:3d}/{CONFIG['epochs']} | "
+#                   f"Train Loss: {avg_train_loss:.4f} | "
+#                   f"Val Loss: {avg_val_loss:.4f} | "
+#                   f"Val AUC: {val_auc:.4f} | "
+#                   f"Time: {time.time()-start:.1f}s")
+
+#         if val_auc > best_val_auc:
+#             best_val_auc = val_auc
+#             patience_ctr = 0
+#             torch.save(model.state_dict(), 'model_data/best_dkt_model_v4.pth')
+#         else:
+#             patience_ctr += 1
+#             if patience_ctr >= CONFIG['patience']:
+#                 print(f"   ⏹️  Early stopping at epoch {epoch+1}")
+#                 break
+
+#     print(f"   ✅ Best Val AUC: {best_val_auc:.4f}")
+#     return history, best_val_auc
+
+# # ==================== EVALUATE DKT ====================
+# def evaluate_dkt(model, X_test, y_test):
+#     model.eval()
+#     ds = DataLoader(TensorDataset(torch.FloatTensor(X_test)), batch_size=64)
+#     all_preds = []
+#     with torch.no_grad():
+#         for (xb,) in ds:
+#             preds = torch.sigmoid(model(xb.to(device)))
+#             all_preds.append(preds.cpu().numpy())
+#     all_preds = np.vstack(all_preds)
+
+#     print(f"\n📊 DKT Evaluation Results:")
+#     print(f"   {'Domain':<20} {'AUC':>8} {'Accuracy':>10} {'N Tested':>10}")
+#     print(f"   {'-'*52}")
+
+#     domain_aucs = []
+#     domain_accs = []
+
+#     for d, domain in enumerate(domains):
+#         mask = y_test[:, d] >= 0
+#         y_true = y_test[:, d][mask]
+#         y_pred_prob = all_preds[:, d][mask]
+#         y_pred_bin = (y_pred_prob > 0.5).astype(int)
+
+#         n_tested = len(y_true)
+#         acc = accuracy_score(y_true, y_pred_bin) if n_tested > 0 else 0.0
+
+#         if n_tested > 0 and len(np.unique(y_true)) > 1:
+#             try:
+#                 auc = roc_auc_score(y_true, y_pred_prob)
+#             except:
+#                 auc = 0.5
+#         else:
+#             auc = 0.5
+
+#         domain_aucs.append(auc)
+#         domain_accs.append(acc)
+#         print(f"   {domain:<20} {auc:>8.4f} {acc:>10.4f} {n_tested:>10}")
+
+#     mean_auc = np.mean(domain_aucs)
+#     mean_acc = np.mean(domain_accs)
+#     print(f"   {'-'*52}")
+#     print(f"   {'MEAN':<20} {mean_auc:>8.4f} {mean_acc:>10.4f}")
+
+#     return mean_auc, mean_acc, all_preds
+
+# # ==================== KNOWLEDGE STATE DEMO ====================
+# def demo_knowledge_state(model, df, student_id=None):
+#     if student_id is None:
+#         student_id = df['student_id'].unique()[0]
+
+#     student_data = df[df["student_id"] == student_id].reset_index(drop=True)
+#     print(f"\n🧠 Knowledge State Demo — Student: {student_id}")
+#     print(f"   Total attempts: {len(student_data)}")
+
+#     interactions = []
+#     for _, row in student_data.iterrows():
+#         domain_idx = domain_to_idx[row['domain_id']]
+#         correct = int(row['correct'])
+#         fatigue = float(row['session_fatigue_index'])
+#         frustration = float(row['frustration_flag'])
+#         interaction = encode_interaction(domain_idx, correct, fatigue, frustration)
+#         interactions.append(interaction)
+
+#     checkpoints = [5, 10, 20, 50, 100, 200, min(295, len(interactions) - 1)]
+#     checkpoints = [c for c in checkpoints if c < len(interactions)]
+
+#     print(f"\n   {'Domain':<22}", end='')
+#     for cp in checkpoints:
+#         print(f"  After {cp:2d} tasks", end='')
+#     print()
+#     print(f"   {'-'*70}")
+
+#     for d, domain in enumerate(domains):
+#         print(f"   {domain:<22}", end='')
+#         for cp in checkpoints:
+#             seq = np.array(interactions[:cp])
+#             if len(seq) < 20:
+#                 pad = np.zeros((20 - len(seq), input_size), dtype=np.float32)
+#                 seq = np.vstack([pad, seq])
+#             else:
+#                 seq = seq[-20:]
+
+#             x = torch.FloatTensor(seq).unsqueeze(0).to(device)
+#             with torch.no_grad():
+#                 ks = model.get_knowledge_state(x)
+#             mastery = ks[0, d].item() * 100
+#             print(f"  {mastery:5.1f}%", end='')
+#         print()
+
+# # ==================== RUN TRAINING ====================
+# dkt_model = DKTModel(
+#     input_size=input_size,
+#     hidden_size=CONFIG['hidden_size'],
+#     num_layers=CONFIG['num_layers'],
+#     n_domains=n_domains,
+#     dropout=CONFIG['dropout']
+# ).to(device)
+
+# history, best_val_auc = train_dkt(dkt_model, X_train, X_val, y_train, y_val)
+
+# # Load best model
+# dkt_model.load_state_dict(torch.load('model_data/best_dkt_model_v4.pth'))
+
+# # Evaluate
+# mean_auc, mean_acc, test_preds = evaluate_dkt(dkt_model, X_test, y_test)
+
+# # Knowledge state demo
+# demo_knowledge_state(dkt_model, df)
+
+# # ==================== SAVE ====================
+# print("\n💾 Saving DKT model...")
+
+# torch.save(dkt_model.state_dict(), 'model_data/dkt_model_final_v4.pth')
+
+# dkt_meta = {
+#     'config': CONFIG,
+#     'domains': domains,
+#     'domain_to_idx': domain_to_idx,
+#     'n_domains': n_domains,
+#     'n_skills': n_skills,
+#     'n_behavioral': n_behavioral,
+#     'input_size': input_size,
+#     'results': {
+#         'mean_auc': float(mean_auc),
+#         'mean_acc': float(mean_acc),
+#         'best_val_auc': float(best_val_auc),
+#     },
+#     'history': {k: [float(v) for v in vals] for k, vals in history.items()}
+# }
+
+# with open('model_data/dkt_meta_v4.json', 'w') as f:
+#     json.dump(dkt_meta, f, indent=2)
+
+# np.save('model_data/dkt_X_test_v4.npy', X_test)
+# np.save('model_data/dkt_y_test_v4.npy', y_test)
+
+# print(f"\n{'='*60}")
+# print("✅ DKT TRAINING COMPLETE (V4)!")
+# print(f"{'='*60}")
+# print(f"   Mean AUC:     {mean_auc:.4f}")
+# print(f"   Mean Acc:     {mean_acc:.4f}")
+# print(f"   Best Val AUC: {best_val_auc:.4f}")
+# print(f"   Domains:      {n_domains}")
+# print(f"   Input dim:    {input_size} ({n_skills} + {n_behavioral} behavioral)")
+# print(f"\n   What DKT gives you:")
+# print(f"   → Per-domain mastery score (0-100%) per student")
+# print(f"   → Knowledge state evolution over time")
+# print(f"   → Behavioral-aware predictions (fatigue + frustration)")
+# print(f"\n📁 Saved: model_data/dkt_model_final_v4.pth")
+
+# """
+# COGNIFY - Deep Knowledge Tracing (DKT) V4
+# =========================================
+# Tracks student knowledge state per domain over time.
+
+# OOM FIXES APPLIED:
+#   1. batch_size: 32 → 8 with gradient accumulation (effective batch = 32)
+#   2. Optional: hidden_size 256→128, num_layers 3→2 (uncomment if still OOM)
+#   3. Optional: subsample to 80K sequences (uncomment if still OOM)
+
+# Run after: generate_asd_data_v4.py → cognify_synthetic_data.csv
+# """
+
+# import numpy as np
+# import torch
+# import torch.nn as nn
+# from torch.utils.data import DataLoader, TensorDataset
+# from sklearn.metrics import accuracy_score, roc_auc_score
+# import pandas as pd
+# import json
+# import os
+# import time
+# import warnings
+# warnings.filterwarnings('ignore')
+
+# print("=" * 60)
+# print("COGNIFY - Deep Knowledge Tracing (DKT) V4")
+# print("=" * 60)
+
+# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# print(f"\n🖥️  Device: {device}")
+# if torch.cuda.is_available():
+#     print(f"   GPU: {torch.cuda.get_device_name(0)}")
+
+# # ==================== CONFIG (TUNED + OOM FIXES) ====================
+# CONFIG = {
+#     'hidden_size': 256,          # reduce to 128 if still OOM
+#     'num_layers': 3,             # reduce to 2 if still OOM
+#     'dropout': 0.3,
+#     'batch_size': 8,             # OOM FIX: reduced from 32
+#     'grad_accumulation': 4,      # OOM FIX: 4 steps = effective batch 32
+#     'learning_rate': 0.0005,
+#     'epochs': 150,
+#     'patience': 25,
+#     'weight_decay': 1e-4,
+#     'max_sequences': None,       # set to 80000 if still OOM
+# }
+
+# # ==================== LOAD DATA ====================
+# print("\n📂 Loading data...")
+# os.makedirs('model_data', exist_ok=True)
+
+# df = pd.read_csv('cognify_synthetic_data.csv')
+# df = df.sort_values(['student_id', 'session_id', 'sequence_step']).reset_index(drop=True)
+
+# domains = sorted(df['domain_id'].unique().tolist())
+# domain_to_idx = {d: i for i, d in enumerate(domains)}
+# n_domains = len(domains)
+
+# print(f"   Records:  {len(df)}")
+# print(f"   Students: {df['student_id'].nunique()}")
+# print(f"   Domains:  {n_domains} → {domains}")
+
+# # ==================== DKT INPUT ENCODING ====================
+# n_skills = n_domains * 2
+# n_behavioral = 2
+# input_size = n_skills + n_behavioral
+# print(f"\n🔧 DKT encoding: {input_size} dim ({n_skills} domain-outcome + {n_behavioral} behavioral)")
+
+
+# def encode_interaction(domain_idx, correct, fatigue, frustration):
+#     vec = np.zeros(input_size, dtype=np.float32)
+#     if correct:
+#         vec[domain_idx] = 1.0
+#     else:
+#         vec[domain_idx + n_domains] = 1.0
+#     vec[n_skills] = fatigue
+#     vec[n_skills + 1] = frustration
+#     return vec
+
+
+# def build_dkt_sequences(df, min_seq_len=5):
+#     X_sequences = []
+#     y_sequences = []
+#     student_ids = []
+
+#     for student_id in df['student_id'].unique():
+#         student_data = df[df["student_id"] == student_id].reset_index(drop=True)
+
+#         if len(student_data) < min_seq_len + 2:
+#             continue
+
+#         interactions = []
+#         targets = []
+
+#         for _, row in student_data.iterrows():
+#             domain_idx = domain_to_idx[row["domain_id"]]
+#             correct = int(row["correct"])
+#             fatigue = float(row["session_fatigue_index"])
+#             frustration = float(row["frustration_flag"])
+
+#             interaction = encode_interaction(domain_idx, correct, fatigue, frustration)
+#             interactions.append(interaction)
+#             targets.append((domain_idx, correct))
+
+#         for i in range(min_seq_len, len(interactions) - 1):
+#             seq_x = np.array(interactions[max(0, i - 20):i])
+
+#             next_domain, next_correct = targets[i]
+
+#             target = np.full(n_domains, -1.0, dtype=np.float32)
+#             target[next_domain] = float(next_correct)
+
+#             if len(seq_x) < 20:
+#                 pad = np.zeros((20 - len(seq_x), input_size), dtype=np.float32)
+#                 seq_x = np.vstack([pad, seq_x])
+
+#             X_sequences.append(seq_x)
+#             y_sequences.append(target)
+#             student_ids.append(student_id)
+
+#     return np.array(X_sequences, dtype=np.float32), np.array(y_sequences, dtype=np.float32), student_ids
+
+
+# print("\n🔁 Building DKT sequences...")
+# X_dkt, y_dkt, student_ids_dkt = build_dkt_sequences(df)
+# print(f"   Sequences shape: {X_dkt.shape}")
+# print(f"   Targets shape:   {y_dkt.shape}")
+
+# # OOM FIX: Optional subsample to reduce RAM
+# if CONFIG['max_sequences'] and len(X_dkt) > CONFIG['max_sequences']:
+#     np.random.seed(42)
+#     idx = np.random.choice(len(X_dkt), CONFIG['max_sequences'], replace=False)
+#     X_dkt = X_dkt[idx]
+#     y_dkt = y_dkt[idx]
+#     student_ids_dkt = [student_ids_dkt[i] for i in idx]
+#     print(f"   Subsampled to {CONFIG['max_sequences']:,} sequences")
+
+# # Train/val/test split (by student to avoid leakage)
+# unique_students = list(set(student_ids_dkt))
+# np.random.seed(42)
+# np.random.shuffle(unique_students)
+
+# n_train = int(len(unique_students) * 0.7)
+# n_val = int(len(unique_students) * 0.15)
+
+# train_students = set(unique_students[:n_train])
+# val_students = set(unique_students[n_train:n_train + n_val])
+# test_students = set(unique_students[n_train + n_val:])
+
+# train_mask = [sid in train_students for sid in student_ids_dkt]
+# val_mask = [sid in val_students for sid in student_ids_dkt]
+# test_mask = [sid in test_students for sid in student_ids_dkt]
+
+# X_train = X_dkt[train_mask]
+# X_val = X_dkt[val_mask]
+# X_test = X_dkt[test_mask]
+# y_train = y_dkt[train_mask]
+# y_val = y_dkt[val_mask]
+# y_test = y_dkt[test_mask]
+
+# print(f"   Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
+
+# # ==================== MASKED LOSS ====================
+# class MaskedBCEWithLogitsLoss(nn.Module):
+#     def __init__(self):
+#         super().__init__()
+#         self.bce = nn.BCEWithLogitsLoss(reduction='none')
+
+#     def forward(self, preds, targets):
+#         mask = (targets >= 0).float()
+#         if mask.sum() == 0:
+#             return torch.tensor(0.0, requires_grad=True, device=preds.device)
+#         loss = self.bce(preds, targets)
+#         loss = (loss * mask).sum() / mask.sum()
+#         return loss
+
+# # ==================== DKT MODEL ====================
+# class DKTModel(nn.Module):
+#     def __init__(self, input_size, hidden_size, num_layers, n_domains, dropout=0.3):
+#         super(DKTModel, self).__init__()
+#         self.hidden_size = hidden_size
+#         self.n_domains = n_domains
+
+#         self.lstm = nn.LSTM(
+#             input_size=input_size,
+#             hidden_size=hidden_size,
+#             num_layers=num_layers,
+#             batch_first=True,
+#             dropout=dropout if num_layers > 1 else 0,
+#         )
+#         self.output_layer = nn.Linear(hidden_size, n_domains)
+
+#     def forward(self, x):
+#         lstm_out, (h_n, _) = self.lstm(x)
+#         last_hidden = lstm_out[:, -1, :]
+#         predictions = self.output_layer(last_hidden)
+#         return predictions
+
+#     def get_knowledge_state(self, x):
+#         with torch.no_grad():
+#             preds = self.forward(x)
+#             return torch.sigmoid(preds)
+
+# # ==================== TRAINING (OOM FIX: GRADIENT ACCUMULATION) ====================
+# def train_dkt(model, X_train, X_val, y_train, y_val):
+#     train_ds = TensorDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_train))
+#     val_ds = TensorDataset(torch.FloatTensor(X_val), torch.FloatTensor(y_val))
+#     train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True)
+#     val_loader = DataLoader(val_ds, batch_size=CONFIG['batch_size'])
+
+#     criterion = MaskedBCEWithLogitsLoss()
+#     optimizer = torch.optim.Adam(
+#         model.parameters(),
+#         lr=CONFIG['learning_rate'],
+#         weight_decay=CONFIG['weight_decay']
+#     )
+#     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+#         optimizer, patience=5, factor=0.5
+#     )
+
+#     best_val_auc = 0
+#     patience_ctr = 0
+#     history = {'train_loss': [], 'val_loss': [], 'val_auc': []}
+
+#     print(f"\n🏋️  Training DKT Model (V4)...")
+#     print(f"   Parameters: {sum(p.numel() for p in model.parameters()):,}")
+#     print(f"   Epochs: {CONFIG['epochs']} | Patience: {CONFIG['patience']}")
+#     print(f"   LR: {CONFIG['learning_rate']} | Hidden: {CONFIG['hidden_size']} | Layers: {CONFIG['num_layers']}")
+#     print(f"   Batch: {CONFIG['batch_size']} (accumulation: {CONFIG['grad_accumulation']})")
+#     print(f"   Effective batch: {CONFIG['batch_size'] * CONFIG['grad_accumulation']}")
+#     print(f"   Input: {input_size} dim ({n_skills} domain + {n_behavioral} behavioral)")
+#     print(f"   Loss: MaskedBCEWithLogitsLoss (only tested domain)")
+
+#     for epoch in range(CONFIG['epochs']):
+#         start = time.time()
+
+#         model.train()
+#         train_loss = 0
+#         optimizer.zero_grad()
+
+#         for i, (X_batch, y_batch) in enumerate(train_loader):
+#             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+
+#             preds = model(X_batch)
+#             loss = criterion(preds, y_batch) / CONFIG['grad_accumulation']
+#             loss.backward()
+#             train_loss += loss.item() * CONFIG['grad_accumulation']
+
+#             if (i + 1) % CONFIG['grad_accumulation'] == 0:
+#                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+#                 optimizer.step()
+#                 optimizer.zero_grad()
+
+#         # Handle leftover gradients if dataset not divisible by accumulation
+#         if (i + 1) % CONFIG['grad_accumulation'] != 0:
+#             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+#             optimizer.step()
+#             optimizer.zero_grad()
+
+#         model.eval()
+#         val_loss = 0
+#         val_preds_all, val_targets_all = [], []
+#         with torch.no_grad():
+#             for X_batch, y_batch in val_loader:
+#                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+#                 preds = model(X_batch)
+#                 loss = criterion(preds, y_batch)
+#                 val_loss += loss.item()
+#                 val_preds_all.append(torch.sigmoid(preds).cpu().numpy())
+#                 val_targets_all.append(y_batch.cpu().numpy())
+
+#         avg_train_loss = train_loss / len(train_loader)
+#         avg_val_loss = val_loss / len(val_loader)
+
+#         val_preds_arr = np.vstack(val_preds_all)
+#         val_targets_arr = np.vstack(val_targets_all)
+
+#         aucs = []
+#         for d in range(n_domains):
+#             mask = val_targets_arr[:, d] >= 0
+#             y_true_d = val_targets_arr[:, d][mask]
+#             y_pred_d = val_preds_arr[:, d][mask]
+
+#             if len(y_true_d) > 0 and len(np.unique(y_true_d)) > 1:
+#                 try:
+#                     auc = roc_auc_score(y_true_d, y_pred_d)
+#                     aucs.append(auc)
+#                 except:
+#                     pass
+
+#         val_auc = np.mean(aucs) if aucs else 0.5
+
+#         history['train_loss'].append(avg_train_loss)
+#         history['val_loss'].append(avg_val_loss)
+#         history['val_auc'].append(val_auc)
+#         scheduler.step(avg_val_loss)
+
+#         if (epoch + 1) % 5 == 0 or epoch == 0:
+#             print(f"   Epoch {epoch+1:3d}/{CONFIG['epochs']} | "
+#                   f"Train Loss: {avg_train_loss:.4f} | "
+#                   f"Val Loss: {avg_val_loss:.4f} | "
+#                   f"Val AUC: {val_auc:.4f} | "
+#                   f"Time: {time.time()-start:.1f}s")
+
+#         if val_auc > best_val_auc:
+#             best_val_auc = val_auc
+#             patience_ctr = 0
+#             torch.save(model.state_dict(), 'model_data/best_dkt_model_v4.pth')
+#         else:
+#             patience_ctr += 1
+#             if patience_ctr >= CONFIG['patience']:
+#                 print(f"   ⏹️  Early stopping at epoch {epoch+1}")
+#                 break
+
+#     print(f"   ✅ Best Val AUC: {best_val_auc:.4f}")
+#     return history, best_val_auc
+
+# # ==================== EVALUATION ====================
+# def evaluate_dkt(model, X_test, y_test):
+#     model.eval()
+#     ds = DataLoader(TensorDataset(torch.FloatTensor(X_test)), batch_size=64)
+#     all_preds = []
+#     with torch.no_grad():
+#         for (xb,) in ds:
+#             preds = torch.sigmoid(model(xb.to(device)))
+#             all_preds.append(preds.cpu().numpy())
+#     all_preds = np.vstack(all_preds)
+
+#     print(f"\n📊 DKT Evaluation Results:")
+#     print(f"   {'Domain':<20} {'AUC':>8} {'Accuracy':>10} {'N Tested':>10}")
+#     print(f"   {'-'*52}")
+
+#     domain_aucs = []
+#     domain_accs = []
+
+#     for d, domain in enumerate(domains):
+#         mask = y_test[:, d] >= 0
+#         y_true = y_test[:, d][mask]
+#         y_pred_prob = all_preds[:, d][mask]
+#         y_pred_bin = (y_pred_prob > 0.5).astype(int)
+
+#         n_tested = len(y_true)
+#         acc = accuracy_score(y_true, y_pred_bin) if n_tested > 0 else 0.0
+
+#         if n_tested > 0 and len(np.unique(y_true)) > 1:
+#             try:
+#                 auc = roc_auc_score(y_true, y_pred_prob)
+#             except:
+#                 auc = 0.5
+#         else:
+#             auc = 0.5
+
+#         domain_aucs.append(auc)
+#         domain_accs.append(acc)
+#         print(f"   {domain:<20} {auc:>8.4f} {acc:>10.4f} {n_tested:>10}")
+
+#     mean_auc = np.mean(domain_aucs)
+#     mean_acc = np.mean(domain_accs)
+#     print(f"   {'-'*52}")
+#     print(f"   {'MEAN':<20} {mean_auc:>8.4f} {mean_acc:>10.4f}")
+
+#     return mean_auc, mean_acc, all_preds
+
+# # ==================== KNOWLEDGE STATE DEMO ====================
+# def demo_knowledge_state(model, df, student_id=None):
+#     if student_id is None:
+#         student_id = df['student_id'].unique()[0]
+
+#     student_data = df[df["student_id"] == student_id].reset_index(drop=True)
+#     print(f"\n🧠 Knowledge State Demo — Student: {student_id}")
+#     print(f"   Total attempts: {len(student_data)}")
+
+#     interactions = []
+#     for _, row in student_data.iterrows():
+#         domain_idx = domain_to_idx[row['domain_id']]
+#         correct = int(row['correct'])
+#         fatigue = float(row['session_fatigue_index'])
+#         frustration = float(row['frustration_flag'])
+#         interaction = encode_interaction(domain_idx, correct, fatigue, frustration)
+#         interactions.append(interaction)
+
+#     checkpoints = [5, 10, 20, 50, 100, 200, min(295, len(interactions) - 1)]
+#     checkpoints = [c for c in checkpoints if c < len(interactions)]
+
+#     print(f"\n   {'Domain':<22}", end='')
+#     for cp in checkpoints:
+#         print(f"  After {cp:2d} tasks", end='')
+#     print()
+#     print(f"   {'-'*70}")
+
+#     for d, domain in enumerate(domains):
+#         print(f"   {domain:<22}", end='')
+#         for cp in checkpoints:
+#             seq = np.array(interactions[:cp])
+#             if len(seq) < 20:
+#                 pad = np.zeros((20 - len(seq), input_size), dtype=np.float32)
+#                 seq = np.vstack([pad, seq])
+#             else:
+#                 seq = seq[-20:]
+
+#             x = torch.FloatTensor(seq).unsqueeze(0).to(device)
+#             with torch.no_grad():
+#                 ks = model.get_knowledge_state(x)
+#             mastery = ks[0, d].item() * 100
+#             print(f"  {mastery:5.1f}%", end='')
+#         print()
+
+# # ==================== RUN ====================
+# dkt_model = DKTModel(
+#     input_size=input_size,
+#     hidden_size=CONFIG['hidden_size'],
+#     num_layers=CONFIG['num_layers'],
+#     n_domains=n_domains,
+#     dropout=CONFIG['dropout']
+# ).to(device)
+
+# history, best_val_auc = train_dkt(dkt_model, X_train, X_val, y_train, y_val)
+
+# dkt_model.load_state_dict(torch.load('model_data/best_dkt_model_v4.pth'))
+
+# mean_auc, mean_acc, test_preds = evaluate_dkt(dkt_model, X_test, y_test)
+
+# demo_knowledge_state(dkt_model, df)
+
+# # ==================== SAVE ====================
+# print("\n💾 Saving DKT model...")
+
+# torch.save(dkt_model.state_dict(), 'model_data/dkt_model_final_v4.pth')
+
+# dkt_meta = {
+#     'config': CONFIG,
+#     'domains': domains,
+#     'domain_to_idx': domain_to_idx,
+#     'n_domains': n_domains,
+#     'n_skills': n_skills,
+#     'n_behavioral': n_behavioral,
+#     'input_size': input_size,
+#     'results': {
+#         'mean_auc': float(mean_auc),
+#         'mean_acc': float(mean_acc),
+#         'best_val_auc': float(best_val_auc),
+#     },
+#     'history': {k: [float(v) for v in vals] for k, vals in history.items()}
+# }
+
+# with open('model_data/dkt_meta_v4.json', 'w') as f:
+#     json.dump(dkt_meta, f, indent=2)
+
+# np.save('model_data/dkt_X_test_v4.npy', X_test)
+# np.save('model_data/dkt_y_test_v4.npy', y_test)
+
+# print(f"\n{'='*60}")
+# print("✅ DKT TRAINING COMPLETE (V4)!")
+# print(f"{'='*60}")
+# print(f"   Mean AUC:     {mean_auc:.4f}")
+# print(f"   Mean Acc:     {mean_acc:.4f}")
+# print(f"   Best Val AUC: {best_val_auc:.4f}")
+# print(f"   Domains:      {n_domains}")
+# print(f"   Input dim:    {input_size} ({n_skills} + {n_behavioral} behavioral)")
+# print(f"\n   What DKT gives you:")
+# print(f"   → Per-domain mastery score (0-100%) per student")
+# print(f"   → Knowledge state evolution over time")
+# print(f"   → Behavioral-aware predictions (fatigue + frustration)")
+# print(f"\n📁 Saved: model_data/dkt_model_final_v4.pth")
+
 """
-COGNIFY - Deep Knowledge Tracing (DKT) V3 TUNED
-=================================================
-Tracks student knowledge state per domain over time.
-Standard DKT formulation from Piech et al. (2015):
-  Input:  one-hot encoding of (skill, outcome) + behavioral context
-  Output: probability of correct on each skill next time — size n_skills
-
-TUNING CHANGES:
-  - hidden_size: 128 → 256
-  - num_layers: 2 → 3
-  - Input: + session_fatigue_index + frustration_flag (18-dim)
-  - epochs: 80 → 150, lr: 0.001 → 0.0005, patience: 15 → 25
-
-Run after: generate_asd_data_v3.py
+train_dkt_tuned.py
+Cognify — Exercise-Aware Deep Knowledge Tracing (EA-DKT) V6
+Upgraded to handle dynamic domain switching via exercise embeddings.
 """
 
 import numpy as np
@@ -20,16 +1415,14 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import accuracy_score, roc_auc_score
-import pandas as pd
 import pickle
-import json
-import os
+import pandas as pd
 import time
 import warnings
 warnings.filterwarnings('ignore')
 
 print("=" * 60)
-print("COGNIFY - Deep Knowledge Tracing (DKT) V3 TUNED")
+print("COGNIFY - Exercise-Aware DKT (V6)")
 print("=" * 60)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -37,271 +1430,154 @@ print(f"\n🖥️  Device: {device}")
 if torch.cuda.is_available():
     print(f"   GPU: {torch.cuda.get_device_name(0)}")
 
-# ==================== CONFIG (TUNED) ====================
-CONFIG = {
-    'hidden_size': 256,       # TUNED: 128 → 256
-    'num_layers': 3,          # TUNED: 2 → 3
-    'dropout': 0.3,
-    'batch_size': 32,
-    'learning_rate': 0.0005,  # TUNED: 0.001 → 0.0005
-    'epochs': 150,            # TUNED: 80 → 150
-    'patience': 25,           # TUNED: 15 → 25
-    'weight_decay': 1e-4,
-}
-
 # ==================== LOAD DATA ====================
-print("\n📂 Loading data...")
-os.makedirs('model_data', exist_ok=True)
-df = pd.read_csv('cognify_synthetic_data_v3.csv')
-df = df.sort_values(['student_id', 'session_id', 'sequence_step']).reset_index(drop=True)
+print("\n📂 Loading preprocessed DKT arrays...")
+with open("model_data/feature_info.pkl", "rb") as f:
+    info = pickle.load(f)
 
-domains = sorted(df['domain_id'].unique().tolist())
-domain_to_idx = {d: i for i, d in enumerate(domains)}
-n_domains = len(domains)
+domains = info["domains"]
+n_domains = info["n_domains"]
+input_size = info["dkt_input_size"] # 20
 
-print(f"   Records:  {len(df)}")
-print(f"   Students: {df['student_id'].nunique()}")
-print(f"   Domains:  {n_domains} → {domains}")
+X_train = np.load("model_data/dkt_X_train.npy")
+X_val = np.load("model_data/dkt_X_val.npy")
+X_test = np.load("model_data/dkt_X_test.npy")
+y_train = np.load("model_data/dkt_y_train.npy")
+y_val = np.load("model_data/dkt_y_val.npy")
+y_test = np.load("model_data/dkt_y_test.npy")
 
-# ==================== DKT INPUT ENCODING (TUNED: + behavioral) ====================
-n_skills = n_domains * 2
-n_behavioral = 2  # fatigue_index + frustration_flag
-input_size = n_skills + n_behavioral
-print(f"\n🔧 DKT encoding: {input_size} dim ({n_skills} domain-outcome + {n_behavioral} behavioral)")
-
-def encode_interaction(domain_idx, correct, fatigue, frustration):
-    """
-    Enhanced DKT encoding with behavioral context.
-    vec[0:n_domains] = correct one-hot
-    vec[n_domains:2*n_domains] = incorrect one-hot
-    vec[2*n_domains] = session_fatigue_index
-    vec[2*n_domains+1] = frustration_flag
-    """
-    vec = np.zeros(input_size)
-    if correct:
-        vec[domain_idx] = 1.0
-    else:
-        vec[domain_idx + n_domains] = 1.0
-    vec[n_skills] = fatigue
-    vec[n_skills + 1] = frustration
-    return vec
-
-def build_dkt_sequences(df, min_seq_len=5):
-    """
-    Standard DKT sequence building with behavioral context.
-    Target format: -1 for untested domains, 0/1 for tested domain.
-    """
-    X_sequences = []
-    y_sequences = []
-    student_ids = []
-
-    for student_id in df['student_id'].unique():
-        student_data = df[df["student_id"] == student_id].reset_index(drop=True)
-
-        if len(student_data) < min_seq_len + 2:
-            continue
-
-        interactions = []
-        targets = []
-
-        for _, row in student_data.iterrows():
-            domain_idx = domain_to_idx[row["domain_id"]]
-            correct = int(row["correct"])
-            fatigue = float(row["session_fatigue_index"])
-            frustration = float(row["frustration_flag"])
-
-            interaction = encode_interaction(domain_idx, correct, fatigue, frustration)
-            interactions.append(interaction)
-            targets.append((domain_idx, correct))
-
-        # Build sequences: predict step i from history [0:i]
-        for i in range(min_seq_len, len(interactions) - 1):
-            seq_x = np.array(interactions[max(0, i-20):i])
-
-            # Target: the NEXT interaction's (domain, correctness)
-            next_domain, next_correct = targets[i]
-
-            # -1 for untested, 0/1 for tested
-            target = np.full(n_domains, -1.0)
-            target[next_domain] = float(next_correct)
-
-            # Pad if shorter than 20
-            if len(seq_x) < 20:
-                pad = np.zeros((20 - len(seq_x), input_size))
-                seq_x = np.vstack([pad, seq_x])
-
-            X_sequences.append(seq_x)
-            y_sequences.append(target)
-            student_ids.append(student_id)
-
-    return np.array(X_sequences), np.array(y_sequences), student_ids
-
-print("\n🔁 Building DKT sequences...")
-X_dkt, y_dkt, student_ids_dkt = build_dkt_sequences(df)
-print(f"   Sequences shape: {X_dkt.shape}")
-print(f"   Targets shape:   {y_dkt.shape}")
-print(f"   Target values:   {-1:>3} (untested), {0:>3}/{1:>3} (tested)")
-
-# Train/val/test split (by student to avoid leakage)
-unique_students = list(set(student_ids_dkt))
-np.random.seed(42)
-np.random.shuffle(unique_students)
-
-n_train = int(len(unique_students) * 0.7)
-n_val   = int(len(unique_students) * 0.15)
-
-train_students = set(unique_students[:n_train])
-val_students   = set(unique_students[n_train:n_train + n_val])
-test_students  = set(unique_students[n_train + n_val:])
-
-train_mask = [sid in train_students for sid in student_ids_dkt]
-val_mask   = [sid in val_students   for sid in student_ids_dkt]
-test_mask  = [sid in test_students  for sid in student_ids_dkt]
-
-X_train = X_dkt[train_mask]
-X_val   = X_dkt[val_mask]
-X_test  = X_dkt[test_mask]
-y_train = y_dkt[train_mask]
-y_val   = y_dkt[val_mask]
-y_test  = y_dkt[test_mask]
-
+print(f"   Input Dim: {input_size} | Domains: {n_domains}")
 print(f"   Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
 
-# ==================== MASKED LOSS ====================
+# ==================== CONFIG ====================
+CONFIG = {
+    'embed_size': 64,
+    'exercise_embed_size': 16, 
+    'hidden_size': 128,
+    'num_layers': 2,
+    'dropout': 0.2,
+    'batch_size': 64,
+    'learning_rate': 0.001,
+    'epochs': 100,
+    'patience': 20, 
+    'weight_decay': 1e-5,
+}
+
+# ==================== LOSS ====================
 class MaskedBCEWithLogitsLoss(nn.Module):
-    """
-    Masked BCE loss: only compute loss on positions where target != -1.
-    """
     def __init__(self):
         super().__init__()
         self.bce = nn.BCEWithLogitsLoss(reduction='none')
-
     def forward(self, preds, targets):
         mask = (targets >= 0).float()
-        if mask.sum() == 0:
-            return torch.tensor(0.0, requires_grad=True, device=preds.device)
-        loss = self.bce(preds, targets)
-        loss = (loss * mask).sum() / mask.sum()
-        return loss
+        targets_safe = torch.clamp(targets, min=0.0, max=1.0)
+        loss = self.bce(preds, targets_safe) * mask
+        num_valid = mask.sum()
+        if num_valid < 1: return preds.sum() * 0
+        return loss.sum() / num_valid
 
-# ==================== DKT MODEL (TUNED) ====================
-class DKTModel(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, n_domains, dropout=0.3):
-        super(DKTModel, self).__init__()
-        self.hidden_size = hidden_size
+# ==================== MODEL (EA-DKT) ====================
+class EADKTModel(nn.Module):
+    def __init__(self, input_size, n_domains, config):
+        super(EADKTModel, self).__init__()
         self.n_domains = n_domains
-
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0,
+        hidden = config['hidden_size']
+        
+        # FIX 1: Context size is exactly 4 (fatigue, frustration, session_pos, overall_pos)
+        context_size = input_size - (n_domains * 2) 
+        
+        # 1. Context embedding (processes the 4 behavioral/temporal features)
+        self.input_embed = nn.Sequential(
+            nn.Linear(context_size, config['embed_size']), 
+            nn.ReLU(), 
+            nn.Dropout(config['dropout'] * 0.5)
         )
-        self.output_layer = nn.Linear(hidden_size, n_domains)
+        
+        # 2. Exercise (Domain) Embedding (processes the 16-dim one-hot)
+        self.exercise_embed = nn.Linear(n_domains * 2, config['exercise_embed_size'])
+        
+        # 3. LSTM takes combined vector
+        lstm_input_size = config['embed_size'] + config['exercise_embed_size']
+        self.lstm = nn.LSTM(
+            input_size=lstm_input_size, 
+            hidden_size=hidden, 
+            num_layers=config['num_layers'], 
+            batch_first=True, 
+            dropout=config['dropout'] if config['num_layers'] > 1 else 0
+        )
+        
+        self.layer_norm = nn.LayerNorm(hidden)
+        self.output_layer = nn.Linear(hidden, n_domains)
+        self._init_weights()
+
+    def _init_weights(self):
+        for name, param in self.named_parameters():
+            if 'weight_ih' in name: nn.init.xavier_uniform_(param)
+            elif 'weight_hh' in name: nn.init.orthogonal_(param)
+            elif 'bias' in name: nn.init.zeros_(param)
 
     def forward(self, x):
-        lstm_out, (h_n, _) = self.lstm(x)
-        last_hidden = lstm_out[:, -1, :]
-        predictions = self.output_layer(last_hidden)
-        return predictions
+        # Split input: first 16 dims are domain one-hot, last 4 are context
+        domain_onehot = x[:, :, :self.n_domains * 2]
+        context_feats = x[:, :, self.n_domains * 2:]
+        
+        # Embed both paths
+        emb_input = self.input_embed(context_feats)
+        emb_exercise = torch.relu(self.exercise_embed(domain_onehot))
+        
+        # Concatenate and pass to LSTM
+        lstm_in = torch.cat([emb_input, emb_exercise], dim=-1)
+        lstm_out, _ = self.lstm(lstm_in)
+        
+        return self.output_layer(self.layer_norm(lstm_out[:, -1, :]))
 
     def get_knowledge_state(self, x):
-        """Extract knowledge state (sigmoid of predictions)"""
-        with torch.no_grad():
-            preds = self.forward(x)
-            return torch.sigmoid(preds)
+        with torch.no_grad(): return torch.sigmoid(self.forward(x))
+
 
 # ==================== TRAINING ====================
-def train_dkt(model, X_train, X_val, y_train, y_val):
-    train_ds = TensorDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_train))
-    val_ds   = TensorDataset(torch.FloatTensor(X_val),   torch.FloatTensor(y_val))
-    train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True)
-    val_loader   = DataLoader(val_ds,   batch_size=CONFIG['batch_size'])
-
+def train_dkt(model):
+    train_loader = DataLoader(TensorDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_train)), batch_size=CONFIG['batch_size'], shuffle=True)
+    val_loader = DataLoader(TensorDataset(torch.FloatTensor(X_val), torch.FloatTensor(y_val)), batch_size=CONFIG['batch_size'])
+    
     criterion = MaskedBCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=CONFIG['learning_rate'],
-        weight_decay=CONFIG['weight_decay']
-    )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, patience=5, factor=0.5
-    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG['learning_rate'], weight_decay=CONFIG['weight_decay'])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG['epochs'])
 
-    best_val_auc = 0
-    patience_ctr = 0
-    history = {'train_loss': [], 'val_loss': [], 'val_auc': []}
+    best_val_auc, patience_ctr = 0, 0
 
-    print(f"\n🏋️  Training DKT Model (TUNED)...")
-    print(f"   Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"   Epochs: {CONFIG['epochs']} | Patience: {CONFIG['patience']}")
-    print(f"   LR: {CONFIG['learning_rate']} | Hidden: {CONFIG['hidden_size']} | Layers: {CONFIG['num_layers']}")
-    print(f"   Input: {input_size} dim ({n_skills} domain + {n_behavioral} behavioral)")
-    print(f"   Loss: MaskedBCEWithLogitsLoss (only tested domain)")
+    print(f"\n🏋️  Training EA-DKT...")
+    print(f"   Params: {sum(p.numel() for p in model.parameters()):,} | Epochs: {CONFIG['epochs']}")
 
     for epoch in range(CONFIG['epochs']):
         start = time.time()
-
-        # Train
         model.train()
-        train_loss = 0
-        for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        for X_b, y_b in train_loader:
+            X_b, y_b = X_b.to(device), y_b.to(device)
             optimizer.zero_grad()
-            preds = model(X_batch)
-            loss = criterion(preds, y_batch)
+            loss = criterion(model(X_b), y_b)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
-            train_loss += loss.item()
+        scheduler.step()
 
-        # Validate
         model.eval()
-        val_loss = 0
-        val_preds_all, val_targets_all = [], []
+        val_preds, val_targs = [], []
         with torch.no_grad():
-            for X_batch, y_batch in val_loader:
-                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                preds = model(X_batch)
-                loss = criterion(preds, y_batch)
-                val_loss += loss.item()
-                val_preds_all.append(torch.sigmoid(preds).cpu().numpy())
-                val_targets_all.append(y_batch.cpu().numpy())
-
-        avg_train_loss = train_loss / len(train_loader)
-        avg_val_loss = val_loss / len(val_loader)
-
-        val_preds_arr = np.vstack(val_preds_all)
-        val_targets_arr = np.vstack(val_targets_all)
-
-        # Compute AUC per domain (only on tested samples)
+            for X_b, y_b in val_loader:
+                val_preds.append(torch.sigmoid(model(X_b.to(device))).cpu().numpy())
+                val_targs.append(y_b.numpy())
+        
+        vp, vt = np.vstack(val_preds), np.vstack(val_targs)
         aucs = []
         for d in range(n_domains):
-            mask = val_targets_arr[:, d] >= 0
-            y_true_d = val_targets_arr[:, d][mask]
-            y_pred_d = val_preds_arr[:, d][mask]
-
-            if len(y_true_d) > 0 and len(np.unique(y_true_d)) > 1:
-                try:
-                    auc = roc_auc_score(y_true_d, y_pred_d)
-                    aucs.append(auc)
-                except:
-                    pass
-
+            m = vt[:, d] >= 0
+            if m.sum() > 10 and len(np.unique(vt[:, d][m])) > 1:
+                aucs.append(roc_auc_score(vt[:, d][m], vp[:, d][m]))
         val_auc = np.mean(aucs) if aucs else 0.5
 
-        history['train_loss'].append(avg_train_loss)
-        history['val_loss'].append(avg_val_loss)
-        history['val_auc'].append(val_auc)
-        scheduler.step(avg_val_loss)
-
         if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"   Epoch {epoch+1:3d}/{CONFIG['epochs']} | "
-                  f"Train Loss: {avg_train_loss:.4f} | "
-                  f"Val Loss: {avg_val_loss:.4f} | "
-                  f"Val AUC: {val_auc:.4f} | "
-                  f"Time: {time.time()-start:.1f}s")
+            print(f"   Epoch {epoch+1:3d} | Val AUC: {val_auc:.4f} | Time: {time.time()-start:.1f}s")
 
         if val_auc > best_val_auc:
             best_val_auc = val_auc
@@ -312,163 +1588,95 @@ def train_dkt(model, X_train, X_val, y_train, y_val):
             if patience_ctr >= CONFIG['patience']:
                 print(f"   ⏹️  Early stopping at epoch {epoch+1}")
                 break
-
     print(f"   ✅ Best Val AUC: {best_val_auc:.4f}")
-    return history, best_val_auc
+    return best_val_auc
 
-# ==================== EVALUATE DKT ====================
-def evaluate_dkt(model, X_test, y_test):
+# ==================== EVALUATE ====================
+def evaluate_dkt(model):
     model.eval()
-    ds = DataLoader(TensorDataset(torch.FloatTensor(X_test)), batch_size=64)
-    all_preds = []
-    with torch.no_grad():
-        for (xb,) in ds:
-            preds = torch.sigmoid(model(xb.to(device)))
-            all_preds.append(preds.cpu().numpy())
-    all_preds = np.vstack(all_preds)
+    ds = DataLoader(TensorDataset(torch.FloatTensor(X_test)), batch_size=256)
+    preds = np.vstack([torch.sigmoid(model(xb.to(device))).detach().cpu().numpy() for (xb,) in ds])
 
-    print(f"\n📊 DKT Evaluation Results:")
-    print(f"   {'Domain':<20} {'AUC':>8} {'Accuracy':>10} {'N Tested':>10}")
-    print(f"   {'-'*52}")
-
-    domain_aucs = []
-    domain_accs = []
-
+    print(f"\n📊 EA-DKT Evaluation:")
+    print(f"   {'Domain':<22} {'AUC':>8} {'Accuracy':>10}")
+    print(f"   {'-'*42}")
+    aucs, accs = [], []
     for d, domain in enumerate(domains):
-        mask = y_test[:, d] >= 0
-        y_true = y_test[:, d][mask]
-        y_pred_prob = all_preds[:, d][mask]
-        y_pred_bin = (y_pred_prob > 0.5).astype(int)
-
-        n_tested = len(y_true)
-        acc = accuracy_score(y_true, y_pred_bin) if n_tested > 0 else 0.0
-
-        if n_tested > 0 and len(np.unique(y_true)) > 1:
-            try:
-                auc = roc_auc_score(y_true, y_pred_prob)
-            except:
-                auc = 0.5
-        else:
-            auc = 0.5
-
-        domain_aucs.append(auc)
-        domain_accs.append(acc)
-        print(f"   {domain:<20} {auc:>8.4f} {acc:>10.4f} {n_tested:>10}")
-
-    mean_auc = np.mean(domain_aucs)
-    mean_acc = np.mean(domain_accs)
-    print(f"   {'-'*52}")
-    print(f"   {'MEAN':<20} {mean_auc:>8.4f} {mean_acc:>10.4f}")
-
-    return mean_auc, mean_acc, all_preds
+        m = y_test[:, d] >= 0
+        yt, yp = y_test[:, d][m], preds[:, d][m]
+        if len(yt) > 10 and len(np.unique(yt)) > 1:
+            aucs.append(roc_auc_score(yt, yp))
+        else: aucs.append(0.5)
+        accs.append(accuracy_score(yt, (yp > 0.5).astype(int)) if len(yt) > 0 else 0.0)
+        print(f"   {domain:<22} {aucs[-1]:>8.4f} {accs[-1]:>10.4f}")
+    
+    print(f"   {'-'*42}")
+    print(f"   {'MEAN':<22} {np.mean(aucs):>8.4f} {np.mean(accs):>10.4f}")
+    return np.mean(aucs), np.mean(accs)
 
 # ==================== KNOWLEDGE STATE DEMO ====================
-def demo_knowledge_state(model, df, student_id=None):
-    if student_id is None:
+def demo_knowledge_state(model):
+    try:
+        df = pd.read_csv("cognify_synthetic_data.csv")
         student_id = df['student_id'].unique()[0]
+        student_data = df[df["student_id"] == student_id].sort_values(['session_id', 'sequence_step']).reset_index(drop=True)
+        
+        print(f"\n🧠 Knowledge State Evolution — Student: {student_id}")
+        print(f"   Profile: {student_data['cognitive_profile'].iloc[0]}")
+        
+        interactions = []
+        
+        for step_num, (_, row) in enumerate(student_data.iterrows()):
+            d_idx = info["domain_to_idx"][row['domain_id']]
+            c = int(row['correct'])
+            f = float(row['session_fatigue_index'])
+            fr = float(row['frustration_flag'])
+            
+            vec = np.zeros(input_size, dtype=np.float32)
+            if c: vec[d_idx] = 1.0
+            else: vec[d_idx + n_domains] = 1.0
+            vec[n_domains*2] = f
+            vec[n_domains*2 + 1] = fr
+            
+            # FIX 2: Use row directly to avoid index mismatch
+            vec[n_domains*2 + 2] = float(row['session_position_normalized'])
+            vec[n_domains*2 + 3] = step_num / len(student_data)
+            
+            interactions.append(vec)
 
-    student_data = df[df["student_id"] == student_id].reset_index(drop=True)
-    print(f"\n🧠 Knowledge State Demo — Student: {student_id}")
-    print(f"   Total attempts: {len(student_data)}")
+        checkpoints = [5, 20, 50, 100, 150, 200, 250, min(295, len(interactions) - 1)]
+        checkpoints = [c for c in checkpoints if c < len(interactions)]
 
-    interactions = []
-    for _, row in student_data.iterrows():
-        domain_idx = domain_to_idx[row['domain_id']]
-        correct = int(row['correct'])
-        fatigue = float(row['session_fatigue_index'])
-        frustration = float(row['frustration_flag'])
-        interaction = encode_interaction(domain_idx, correct, fatigue, frustration)
-        interactions.append(interaction)
+        print(f"\n   {'Domain':<22}", end='')
+        for cp in checkpoints: print(f"  T={cp:<3}", end='')
+        print("\n   " + "-"*70)
 
-    checkpoints = [5, 10, 20, min(50, len(interactions) - 1)]
-    checkpoints = [c for c in checkpoints if c < len(interactions)]
+        for d, domain in enumerate(domains):
+            print(f"   {domain:<22}", end='')
+            for cp in checkpoints:
+                seq = np.array(interactions[:cp])
+                if len(seq) < 20:
+                    pad = np.zeros((20 - len(seq), input_size), dtype=np.float32)
+                    seq = np.vstack([pad, seq])
+                else: seq = seq[-20:]
+                
+                x = torch.FloatTensor(seq).unsqueeze(0).to(device)
+                mastery = model.get_knowledge_state(x)[0, d].item() * 100
+                print(f"  {mastery:4.1f}%", end='')
+            print()
+    except Exception as e:
+        print(f"\n   (Could not generate demo: {e})")
 
-    print(f"\n   {'Domain':<22}", end='')
-    for cp in checkpoints:
-        print(f"  After {cp:2d} tasks", end='')
-    print()
-    print(f"   {'-'*70}")
+# ==================== RUN ====================
+model = EADKTModel(input_size, n_domains, CONFIG).to(device)
+best_auc = train_dkt(model)
 
-    for d, domain in enumerate(domains):
-        print(f"   {domain:<22}", end='')
-        for cp in checkpoints:
-            seq = np.array(interactions[:cp])
-            if len(seq) < 20:
-                pad = np.zeros((20 - len(seq), input_size))
-                seq = np.vstack([pad, seq])
-            else:
-                seq = seq[-20:]
+model.load_state_dict(torch.load('model_data/best_dkt_model.pth'))
+mean_auc, mean_acc = evaluate_dkt(model)
 
-            x = torch.FloatTensor(seq).unsqueeze(0).to(device)
-            with torch.no_grad():
-                ks = model.get_knowledge_state(x)
-            mastery = ks[0, d].item() * 100
-            print(f"  {mastery:5.1f}%", end='')
-        print()
+demo_knowledge_state(model)
 
-# ==================== RUN TRAINING ====================
-dkt_model = DKTModel(
-    input_size=input_size,
-    hidden_size=CONFIG['hidden_size'],
-    num_layers=CONFIG['num_layers'],
-    n_domains=n_domains,
-    dropout=CONFIG['dropout']
-).to(device)
-
-history, best_val_auc = train_dkt(dkt_model, X_train, X_val, y_train, y_val)
-
-# Load best model
-dkt_model.load_state_dict(torch.load('model_data/best_dkt_model.pth'))
-
-# Evaluate
-mean_auc, mean_acc, test_preds = evaluate_dkt(dkt_model, X_test, y_test)
-
-# Knowledge state demo
-demo_knowledge_state(dkt_model, df)
-
-# ==================== SAVE ====================
-print("\n💾 Saving DKT model...")
-
-torch.save(dkt_model.state_dict(), 'model_data/dkt_model_final_tuned.pth')
-
-dkt_meta = {
-    'config': CONFIG,
-    'domains': domains,
-    'domain_to_idx': domain_to_idx,
-    'n_domains': n_domains,
-    'n_skills': n_skills,
-    'n_behavioral': n_behavioral,
-    'input_size': input_size,
-    'results': {
-        'mean_auc': float(mean_auc),
-        'mean_acc': float(mean_acc),
-        'best_val_auc': float(best_val_auc),
-    },
-    'history': {k: [float(v) for v in vals] for k, vals in history.items()}
-}
-
-with open('model_data/dkt_meta_tuned.json', 'w') as f:
-    json.dump(dkt_meta, f, indent=2)
-
-with open('model_data/dkt_meta_tuned.pkl', 'wb') as f:
-    pickle.dump({
-        **dkt_meta,
-        'encode_interaction_fn': encode_interaction,
-    }, f)
-
-np.save('model_data/dkt_X_test_tuned.npy', X_test)
-np.save('model_data/dkt_y_test_tuned.npy', y_test)
-
+torch.save(model.state_dict(), 'model_data/dkt_model_final.pth')
 print(f"\n{'='*60}")
-print("✅ DKT TRAINING COMPLETE (TUNED)!")
+print(f"✅ EA-DKT V6 COMPLETE | AUC: {mean_auc:.4f} | Acc: {mean_acc:.4f}")
 print(f"{'='*60}")
-print(f"   Mean AUC:     {mean_auc:.4f}")
-print(f"   Mean Acc:     {mean_acc:.4f}")
-print(f"   Best Val AUC: {best_val_auc:.4f}")
-print(f"   Domains:      {n_domains}")
-print(f"   Input dim:    {input_size} ({n_skills} + {n_behavioral} behavioral)")
-print(f"\n   What DKT gives you:")
-print(f"   → Per-domain mastery score (0-100%) per student")
-print(f"   → Knowledge state evolution over time")
-print(f"   → Behavioral-aware predictions (fatigue + frustration)")
-print(f"\n📁 Saved: model_data/dkt_model_final_tuned.pth")
