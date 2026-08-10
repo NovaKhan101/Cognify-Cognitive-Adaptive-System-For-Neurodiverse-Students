@@ -1,1 +1,3 @@
 ml/model_data/*.npy
+.env
+*.env
