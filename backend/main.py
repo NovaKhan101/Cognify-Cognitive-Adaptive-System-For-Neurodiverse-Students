@@ -55,7 +55,9 @@ app = FastAPI(
 
 origins = [  
     "http://localhost:5173",  
-    "http://127.0.0.1:5173",  
+    "http://127.0.0.1:5173",
+    "http://localhost:8080",
+    "http://192.168.1.11:8080"  # <--- ADD THIS EXACT LINE
 ]  
 
 app.add_middleware(  
@@ -157,9 +159,16 @@ def get_student_profile_endpoint(student_id: str, db: Session = Depends(get_db))
 def create_session(session: SessionCreate, db: Session = Depends(get_db)):  
     if not db.query(Student).filter(Student.student_id == session.student_id).first():  
         raise HTTPException(status_code=404, detail="Student not found")  
+        
     count = db.query(SessionModel).count()  
+    candidate_id = f"SES{count + 1:04d}"
+    
+    # FIX: Fallback to UUID if ID already exists (prevents duplicate key crash)
+    if db.query(SessionModel).filter(SessionModel.session_id == candidate_id).first():
+        candidate_id = f"SES{uuid.uuid4().hex[:6].upper()}"
+        
     db_session = SessionModel(  
-        session_id=f"SES{count + 1:04d}",  
+        session_id=candidate_id,  
         student_id=session.student_id,  
         session_start=datetime.now(),  
     )  
@@ -293,13 +302,17 @@ async def get_next_task(request: NextTaskRequest, db: Session = Depends(get_db))
     )
 
     try:
+        # FIX: Prevent ForeignKey violation by setting to None if task_id is 0
+        rec_task_id_val = recommendation.get("recommended_task_id", 0)
+        rec_task_id = str(rec_task_id_val) if rec_task_id_val and rec_task_id_val != 0 else None
+        
         rec_log = Recommendation(
             id=str(uuid.uuid4()),
             student_id=request.student_id,
             session_id=request.session_id,
             recommended_domain=recommendation["predicted_domain"],
             recommended_difficulty=recommendation["recommended_difficulty"],
-            recommended_task_id=str(recommendation.get("recommended_task_id", 0)),
+            recommended_task_id=rec_task_id, 
             task_source=recommendation.get("model_used"),
             domain_confidence=recommendation.get("domain_confidence"),
             student_context=student_context,
