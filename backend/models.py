@@ -114,7 +114,7 @@ class TaskAttempt(Base):
     domain_switch_count     = Column(Integer, default=0)  
     session_position_norm   = Column(Float)  
     sensory_load            = Column(Integer)  
-    task_source             = Column(String(20), default="db")  
+    task_source             = Column(String(50), default="db")  
     gemini_prompt_context   = Column(Text)  
     cognitive_profile       = Column(String(30))
 
@@ -129,7 +129,7 @@ class GeneratedTask(Base):
     visual       = Column(Text)  
     hint         = Column(Text, nullable=False)  
     options      = Column(JSON, nullable=False)  
-    source       = Column(String(20), default="gemini")  
+    source       = Column(String(50), default="gemini")  
     created_at   = Column(DateTime, server_default=func.now())
 
 class StudentTaskHistory(Base):  
@@ -162,7 +162,7 @@ class Recommendation(Base):
     recommended_domain      = Column(String(50))  
     recommended_difficulty  = Column(Integer)  
     recommended_task_id     = Column(String(30))  
-    task_source             = Column(String(20))  
+    task_source             = Column(String(50))  
     domain_confidence       = Column(Float)  
     difficulty_confidence   = Column(Float)  
     task_confidence         = Column(Float)  

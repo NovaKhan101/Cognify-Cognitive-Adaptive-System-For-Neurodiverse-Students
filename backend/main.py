@@ -57,7 +57,11 @@ origins = [
     "http://localhost:5173",  
     "http://127.0.0.1:5173",
     "http://localhost:8080",
-    "http://192.168.1.11:8080"  # <--- ADD THIS EXACT LINE
+    "http://127.0.0.1:8080",
+    "http://192.168.1.11:8080",
+    "http://192.168.1.13:8080",
+    "http://172.20.211.244:8080",
+    "http://172.20.249.84:8080"  # <--- ADD THIS EXACT LINE
 ]  
 
 app.add_middleware(  
@@ -293,7 +297,7 @@ async def get_next_task(request: NextTaskRequest, db: Session = Depends(get_db))
 
     ui_adaptation = get_ui_adaptation_flags(student_context)
 
-    task = await get_task_for_student(
+    task = get_task_for_student(
         domain=recommendation["predicted_domain"],
         difficulty=recommendation["recommended_difficulty"],
         student_id=request.student_id,

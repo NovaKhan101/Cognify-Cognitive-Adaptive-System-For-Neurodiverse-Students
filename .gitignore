@@ -37,4 +37,5 @@ ml/*.csv
 .DS_Store
 Thumbs.db
 .vscode/
-.idea/
+.idea/*.pptx 
+*.ppt 

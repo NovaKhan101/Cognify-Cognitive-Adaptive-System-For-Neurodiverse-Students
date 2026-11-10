@@ -206,7 +206,8 @@ def compute_knowledge_state(attempts_list: List[Dict]) -> Dict[str, float]:
         pad_len = DKT_SEQ_LEN - len(feats)
         feats = np.pad(feats, ((pad_len, 0), (0, 0)), 'constant')
         
-    x = torch.tensor([feats], dtype=torch.float32)
+    # FIX: Convert to numpy array first, then add batch dimension, then to tensor
+    x = torch.from_numpy(feats).float().unsqueeze(0)
     
     with torch.no_grad():
         # Fixed: No domain_indices passed, they are extracted internally from x
