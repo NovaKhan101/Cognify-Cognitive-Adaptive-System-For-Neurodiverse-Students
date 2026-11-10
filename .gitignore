@@ -1,3 +1,40 @@
-ml/model_data/*.npy
+# ── Secrets ──────────────────────────────
 .env
-*.env
+.env.*
+!.env.example
+
+# ── Node / frontend ──────────────────────
+node_modules/
+frontend/node_modules/
+backend/node_modules/
+dist/
+build/
+*.local
+*.log
+
+# ── Python ───────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# ── ML artifacts (never commit) ──────────
+ml/model_data/*.npy
+ml/model_data/*.pt
+ml/model_data/*.pth
+ml/model_data/*.ckpt
+ml/model_data/*.onnx
+*.npy
+*.pt
+*.pth
+
+# optional — uncomment if you want to drop these too
+ml/model_data/*.pkl
+ml/*.csv
+
+# ── Editor / OS ──────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
